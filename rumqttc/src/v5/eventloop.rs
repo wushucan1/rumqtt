@@ -1,6 +1,9 @@
 use super::framed::Network;
 use super::mqttbytes::v5::*;
-use super::{Incoming, MqttOptions, MqttState, Outgoing, Request, StateError, Transport};
+use super::{
+    Incoming, MqttOptions, MqttState, Outgoing, PublishReceipt, PublishReceiptPhase, Request,
+    StateError, Transport,
+};
 use crate::eventloop::socket_connect;
 use crate::framed::AsyncReadWrite;
 
@@ -78,6 +81,9 @@ pub struct EventLoop {
     pub(crate) requests_tx: Sender<Request>,
     /// Pending packets from last session
     pub pending: VecDeque<Request>,
+    /// Requests still in the client channel at disconnect have never reached
+    /// the MQTT state machine and are safe to send in a new session.
+    fresh: VecDeque<Request>,
     /// Network connection to the broker
     network: Option<Network>,
     /// Keep alive time
@@ -89,6 +95,7 @@ pub struct EventLoop {
 pub enum Event {
     Incoming(Incoming),
     Outgoing(Outgoing),
+    PublishReceipt(PublishReceipt),
 }
 
 impl EventLoop {
@@ -108,6 +115,7 @@ impl EventLoop {
             requests_tx,
             requests_rx,
             pending,
+            fresh: VecDeque::new(),
             network: None,
             keepalive_timeout: None,
         }
@@ -135,7 +143,7 @@ impl EventLoop {
             }
         });
 
-        self.pending.extend(requests_in_channel);
+        self.fresh.extend(requests_in_channel);
     }
 
     /// Yields Next notification or outgoing request and periodically pings
@@ -151,7 +159,15 @@ impl EventLoop {
             .await??;
             // Last session might contain packets which aren't acked. If it's a new session, clear the pending packets.
             if !connack.session_present {
-                self.pending.clear();
+                for tracking_id in self.state.discard_session(&mut self.pending) {
+                    self.state
+                        .events
+                        .push_back(Event::PublishReceipt(PublishReceipt {
+                            tracking_id,
+                            packet_id: None,
+                            phase: PublishReceiptPhase::SessionLost,
+                        }));
+                }
             }
             self.network = Some(network);
 
@@ -220,6 +236,7 @@ impl EventLoop {
             // outgoing requests (along with 1b).
             o = Self::next_request(
                 &mut self.pending,
+                &mut self.fresh,
                 &self.requests_rx,
                 self.options.pending_throttle
             ), if !self.pending.is_empty() || (!inflight_full && !collision) => match o {
@@ -256,6 +273,7 @@ impl EventLoop {
 
     async fn next_request(
         pending: &mut VecDeque<Request>,
+        fresh: &mut VecDeque<Request>,
         rx: &Receiver<Request>,
         pending_throttle: Duration,
     ) -> Result<Request, ConnectionError> {
@@ -264,6 +282,8 @@ impl EventLoop {
             // We must call .next() AFTER sleep() otherwise .next() would
             // advance the iterator but the future might be canceled before return
             Ok(pending.pop_front().unwrap())
+        } else if let Some(request) = fresh.pop_front() {
+            Ok(request)
         } else {
             match rx.recv_async().await {
                 Ok(r) => Ok(r),
@@ -431,5 +451,41 @@ async fn mqtt_connect(
         }
         Incoming::ConnAck(connack) => Err(ConnectionError::ConnectionRefused(connack.code)),
         packet => Err(ConnectionError::NotConnAck(Box::new(packet))),
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use crate::v5::mqttbytes::QoS;
+
+    #[tokio::test]
+    async fn unsent_tracked_request_survives_new_session() {
+        let (client, mut eventloop) =
+            super::super::AsyncClient::new(MqttOptions::new("test", "localhost", 1883), 10);
+        client
+            .publish_tracked(11, "test/topic", QoS::AtLeastOnce, false, vec![1])
+            .await
+            .unwrap();
+        eventloop.clean();
+        assert!(eventloop.pending.is_empty());
+        assert!(matches!(
+            eventloop.fresh.front(),
+            Some(Request::TrackedPublish(_, 11))
+        ));
+
+        assert!(eventloop
+            .state
+            .discard_session(&mut eventloop.pending)
+            .is_empty());
+        let request = EventLoop::next_request(
+            &mut eventloop.pending,
+            &mut eventloop.fresh,
+            &eventloop.requests_rx,
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(request, Request::TrackedPublish(_, 11)));
     }
 }

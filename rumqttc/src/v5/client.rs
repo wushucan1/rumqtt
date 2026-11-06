@@ -23,6 +23,8 @@ pub enum ClientError {
     Request(Request),
     #[error("Failed to send mqtt requests to eventloop")]
     TryRequest(Request),
+    #[error("Tracked publishes require QoS 1 or QoS 2")]
+    TrackedQosZero,
 }
 
 impl From<SendError<Request>> for ClientError {
@@ -78,6 +80,7 @@ impl AsyncClient {
         retain: bool,
         payload: P,
         properties: Option<PublishProperties>,
+        tracking_id: Option<u64>,
     ) -> Result<(), ClientError>
     where
         S: Into<String>,
@@ -86,7 +89,13 @@ impl AsyncClient {
         let topic = topic.into();
         let mut publish = Publish::new(&topic, qos, payload, properties);
         publish.retain = retain;
-        let publish = Request::Publish(publish);
+        if tracking_id.is_some() && qos == QoS::AtMostOnce {
+            return Err(ClientError::TrackedQosZero);
+        }
+        let publish = match tracking_id {
+            Some(id) => Request::TrackedPublish(publish, id),
+            None => Request::Publish(publish),
+        };
         if !valid_topic(&topic) {
             return Err(ClientError::Request(publish));
         }
@@ -106,7 +115,7 @@ impl AsyncClient {
         S: Into<String>,
         P: Into<Bytes>,
     {
-        self.handle_publish(topic, qos, retain, payload, Some(properties))
+        self.handle_publish(topic, qos, retain, payload, Some(properties), None)
             .await
     }
 
@@ -121,7 +130,50 @@ impl AsyncClient {
         S: Into<String>,
         P: Into<Bytes>,
     {
-        self.handle_publish(topic, qos, retain, payload, None).await
+        self.handle_publish(topic, qos, retain, payload, None, None)
+            .await
+    }
+
+    /// Queue a QoS 1 or QoS 2 PUBLISH with a local identity. Poll the paired
+    /// EventLoop for `Event::PublishReceipt` to observe its MQTT ACK outcome.
+    pub async fn publish_tracked<S, P>(
+        &self,
+        tracking_id: u64,
+        topic: S,
+        qos: QoS,
+        retain: bool,
+        payload: P,
+    ) -> Result<(), ClientError>
+    where
+        S: Into<String>,
+        P: Into<Bytes>,
+    {
+        self.handle_publish(topic, qos, retain, payload, None, Some(tracking_id))
+            .await
+    }
+
+    pub async fn publish_tracked_with_properties<S, P>(
+        &self,
+        tracking_id: u64,
+        topic: S,
+        qos: QoS,
+        retain: bool,
+        payload: P,
+        properties: PublishProperties,
+    ) -> Result<(), ClientError>
+    where
+        S: Into<String>,
+        P: Into<Bytes>,
+    {
+        self.handle_publish(
+            topic,
+            qos,
+            retain,
+            payload,
+            Some(properties),
+            Some(tracking_id),
+        )
+        .await
     }
 
     /// Attempts to send a MQTT Publish to the `EventLoop`.

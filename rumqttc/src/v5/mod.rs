@@ -33,11 +33,40 @@ pub use crate::proxy::{Proxy, ProxyAuth, ProxyType};
 
 pub type Incoming = Packet;
 
+/// Progress of one outbound QoS 1 or QoS 2 PUBLISH. `tracking_id` must be
+/// unique among outstanding publishes on this physical client. It is local to
+/// the process and is not encoded into the MQTT packet. MQTT ACKs confirm
+/// broker protocol progress, not application processing by a subscriber.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PublishReceipt {
+    pub tracking_id: u64,
+    pub packet_id: Option<u16>,
+    pub phase: PublishReceiptPhase,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PublishReceiptPhase {
+    /// The client assigned a packet identifier to this PUBLISH.
+    PacketIdAssigned,
+    /// The broker accepted the first half of a QoS 2 transaction.
+    PubRec,
+    /// PUBACK (QoS 1) or PUBCOMP (QoS 2) completed successfully.
+    Confirmed,
+    /// A terminal negative acknowledgement was received.
+    Rejected,
+    /// The broker returned CONNACK with Session Present set to false. Delivery
+    /// is unknown: a previous broker may already have processed the PUBLISH.
+    /// Do not infer that replay is safe without application-level deduplication.
+    SessionLost,
+}
+
 /// Requests by the client to mqtt event loop. Request are
 /// handled one by one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Request {
     Publish(Publish),
+    /// A publish with an application-local identity that is never sent on the wire.
+    TrackedPublish(Publish, u64),
     PubAck(PubAck),
     PubRec(PubRec),
     PubComp(PubComp),

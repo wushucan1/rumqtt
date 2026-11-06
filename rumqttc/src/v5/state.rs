@@ -5,11 +5,11 @@ use super::mqttbytes::v5::{
 };
 use super::mqttbytes::{self, Error as MqttError, QoS};
 
-use super::{Event, Incoming, Outgoing, Request};
+use super::{Event, Incoming, Outgoing, PublishReceipt, PublishReceiptPhase, Request};
 
 use bytes::Bytes;
 use fixedbitset::FixedBitSet;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::{io, time::Instant};
 
 /// Errors during state handling
@@ -92,12 +92,15 @@ pub struct MqttState {
     pub(crate) inflight: u16,
     /// Outgoing QoS 1, 2 publishes which aren't acked yet
     pub(crate) outgoing_pub: Vec<Option<Publish>>,
+    /// Application-local identities for outstanding QoS 1/2 packet IDs.
+    tracked_outgoing: HashMap<u16, u64>,
     /// Packet ids of released QoS 2 publishes
     pub(crate) outgoing_rel: FixedBitSet,
     /// Packet ids on incoming QoS 2 publishes
     pub(crate) incoming_pub: FixedBitSet,
     /// Last collision due to broker not acking in order
     pub collision: Option<Publish>,
+    tracked_collision: Option<u64>,
     /// Buffered incoming packets
     pub events: VecDeque<Event>,
     /// Indicates if acknowledgements should be send immediately
@@ -126,9 +129,11 @@ impl MqttState {
             inflight: 0,
             // index 0 is wasted as 0 is not a valid packet id
             outgoing_pub: vec![None; max_inflight as usize + 1],
+            tracked_outgoing: HashMap::new(),
             outgoing_rel: FixedBitSet::with_capacity(max_inflight as usize + 1),
             incoming_pub: FixedBitSet::with_capacity(u16::MAX as usize + 1),
             collision: None,
+            tracked_collision: None,
             // TODO: Optimize these sizes later
             events: VecDeque::with_capacity(100),
             manual_acks,
@@ -144,9 +149,12 @@ impl MqttState {
     pub fn clean(&mut self) -> Vec<Request> {
         let mut pending = Vec::with_capacity(100);
         // remove and collect pending publishes
-        for publish in self.outgoing_pub.iter_mut() {
+        for (pkid, publish) in self.outgoing_pub.iter_mut().enumerate() {
             if let Some(publish) = publish.take() {
-                let request = Request::Publish(publish);
+                let request = match self.tracked_outgoing.get(&(pkid as u16)) {
+                    Some(id) => Request::TrackedPublish(publish, *id),
+                    None => Request::Publish(publish),
+                };
                 pending.push(request);
             }
         }
@@ -167,6 +175,36 @@ impl MqttState {
         pending
     }
 
+    /// Discard the previous MQTT session after CONNACK Session Present = 0.
+    /// Return every tracked message affected, including a QoS 2 PUBREL whose
+    /// PUBLISH was already acknowledged with PUBREC.
+    pub(crate) fn discard_session(&mut self, pending: &mut VecDeque<Request>) -> Vec<u64> {
+        let mut lost = BTreeSet::new();
+        for request in pending.drain(..) {
+            if let Request::TrackedPublish(_, id) = request {
+                lost.insert(id);
+            }
+        }
+        lost.extend(self.tracked_outgoing.drain().map(|(_, id)| id));
+        if let Some(id) = self.tracked_collision.take() {
+            lost.insert(id);
+        }
+        self.collision = None;
+        // A terminal receipt may have been queued just before a network
+        // flush failed. Its packet ID is already gone from tracked_outgoing,
+        // so dropping that event would leave its caller waiting forever.
+        self.events.retain(|event| {
+            matches!(
+                event,
+                Event::PublishReceipt(PublishReceipt {
+                    phase: PublishReceiptPhase::Confirmed | PublishReceiptPhase::Rejected,
+                    ..
+                })
+            )
+        });
+        lost.into_iter().collect()
+    }
+
     pub fn inflight(&self) -> u16 {
         self.inflight
     }
@@ -179,6 +217,9 @@ impl MqttState {
     ) -> Result<Option<Packet>, StateError> {
         let packet = match request {
             Request::Publish(publish) => self.outgoing_publish(publish)?,
+            Request::TrackedPublish(publish, id) => {
+                self.outgoing_publish_tracked(publish, Some(id))?
+            }
             Request::PubRel(pubrel) => self.outgoing_pubrel(pubrel)?,
             Request::Subscribe(subscribe) => self.outgoing_subscribe(subscribe)?,
             Request::Unsubscribe(unsubscribe) => self.outgoing_unsubscribe(unsubscribe)?,
@@ -360,30 +401,28 @@ impl MqttState {
         }
 
         self.inflight -= 1;
-
-        if puback.reason != PubAckReason::Success
-            && puback.reason != PubAckReason::NoMatchingSubscribers
-        {
+        let accepted = matches!(
+            puback.reason,
+            PubAckReason::Success | PubAckReason::NoMatchingSubscribers
+        );
+        if !accepted {
             warn!(
                 "PubAck Pkid = {:?}, reason: {:?}",
                 puback.pkid, puback.reason
             );
-            return Ok(None);
         }
+        let tracking_id = self.tracked_outgoing.remove(&puback.pkid);
+        self.emit_receipt(
+            tracking_id,
+            puback.pkid,
+            if accepted {
+                PublishReceiptPhase::Confirmed
+            } else {
+                PublishReceiptPhase::Rejected
+            },
+        );
 
-        if let Some(publish) = self.check_collision(puback.pkid) {
-            self.outgoing_pub[publish.pkid as usize] = Some(publish.clone());
-            self.inflight += 1;
-
-            let pkid = publish.pkid;
-            let event = Event::Outgoing(Outgoing::Publish(pkid));
-            self.events.push_back(event);
-            self.collision_ping_count = 0;
-
-            return Ok(Some(Packet::Publish(publish)));
-        }
-
-        Ok(None)
+        Ok(self.promote_collision(puback.pkid))
     }
 
     fn handle_incoming_pubrec(&mut self, pubrec: &PubRec) -> Result<Option<Packet>, StateError> {
@@ -397,15 +436,23 @@ impl MqttState {
             return Err(StateError::Unsolicited(pubrec.pkid));
         }
 
-        if pubrec.reason != PubRecReason::Success
-            && pubrec.reason != PubRecReason::NoMatchingSubscribers
-        {
+        let accepted = matches!(
+            pubrec.reason,
+            PubRecReason::Success | PubRecReason::NoMatchingSubscribers
+        );
+        if !accepted {
             warn!(
                 "PubRec Pkid = {:?}, reason: {:?}",
                 pubrec.pkid, pubrec.reason
             );
-            return Ok(None);
+            let tracking_id = self.tracked_outgoing.remove(&pubrec.pkid);
+            self.emit_receipt(tracking_id, pubrec.pkid, PublishReceiptPhase::Rejected);
+            self.inflight -= 1;
+            return Ok(self.promote_collision(pubrec.pkid));
         }
+
+        let tracking_id = self.tracked_outgoing.get(&pubrec.pkid).copied();
+        self.emit_receipt(tracking_id, pubrec.pkid, PublishReceiptPhase::PubRec);
 
         // NOTE: Inflight - 1 for qos2 in comp
         self.outgoing_rel.insert(pubrec.pkid as usize);
@@ -437,31 +484,30 @@ impl MqttState {
     }
 
     fn handle_incoming_pubcomp(&mut self, pubcomp: &PubComp) -> Result<Option<Packet>, StateError> {
-        let outgoing = self.check_collision(pubcomp.pkid).map(|publish| {
-            let pkid = publish.pkid;
-            let event = Event::Outgoing(Outgoing::Publish(pkid));
-            self.events.push_back(event);
-            self.collision_ping_count = 0;
-
-            Packet::Publish(publish)
-        });
-
         if !self.outgoing_rel.contains(pubcomp.pkid as usize) {
             error!("Unsolicited pubcomp packet: {:?}", pubcomp.pkid);
             return Err(StateError::Unsolicited(pubcomp.pkid));
         }
         self.outgoing_rel.set(pubcomp.pkid as usize, false);
-
-        if pubcomp.reason != PubCompReason::Success {
+        let accepted = pubcomp.reason == PubCompReason::Success;
+        if !accepted {
             warn!(
                 "PubComp Pkid = {:?}, reason: {:?}",
                 pubcomp.pkid, pubcomp.reason
             );
-            return Ok(None);
         }
-
+        let tracking_id = self.tracked_outgoing.remove(&pubcomp.pkid);
+        self.emit_receipt(
+            tracking_id,
+            pubcomp.pkid,
+            if accepted {
+                PublishReceiptPhase::Confirmed
+            } else {
+                PublishReceiptPhase::Rejected
+            },
+        );
         self.inflight -= 1;
-        Ok(outgoing)
+        Ok(self.promote_collision(pubcomp.pkid))
     }
 
     fn handle_incoming_pingresp(&mut self) -> Result<Option<Packet>, StateError> {
@@ -471,7 +517,15 @@ impl MqttState {
 
     /// Adds next packet identifier to QoS 1 and 2 publish packets and returns
     /// it buy wrapping publish in packet
-    fn outgoing_publish(&mut self, mut publish: Publish) -> Result<Option<Packet>, StateError> {
+    fn outgoing_publish(&mut self, publish: Publish) -> Result<Option<Packet>, StateError> {
+        self.outgoing_publish_tracked(publish, None)
+    }
+
+    fn outgoing_publish_tracked(
+        &mut self,
+        mut publish: Publish,
+        tracking_id: Option<u64>,
+    ) -> Result<Option<Packet>, StateError> {
         if publish.qos != QoS::AtMostOnce {
             if publish.pkid == 0 {
                 publish.pkid = self.next_pkid();
@@ -486,6 +540,7 @@ impl MqttState {
             {
                 info!("Collision on packet id = {:?}", publish.pkid);
                 self.collision = Some(publish);
+                self.tracked_collision = tracking_id;
                 let event = Event::Outgoing(Outgoing::AwaitAck(pkid));
                 self.events.push_back(event);
                 return Ok(None);
@@ -494,6 +549,9 @@ impl MqttState {
             // if there is an existing publish at this pkid, this implies that broker hasn't acked this
             // packet yet. This error is possible only when broker isn't acking sequentially
             self.outgoing_pub[pkid as usize] = Some(publish.clone());
+            if let Some(id) = tracking_id {
+                self.tracked_outgoing.insert(pkid, id);
+            }
             self.inflight += 1;
         };
 
@@ -521,6 +579,7 @@ impl MqttState {
 
         let event = Event::Outgoing(Outgoing::Publish(pkid));
         self.events.push_back(event);
+        self.emit_receipt(tracking_id, pkid, PublishReceiptPhase::PacketIdAssigned);
 
         Ok(Some(Packet::Publish(publish)))
     }
@@ -637,14 +696,41 @@ impl MqttState {
         Ok(Some(Packet::Disconnect(Disconnect::new(reason))))
     }
 
-    fn check_collision(&mut self, pkid: u16) -> Option<Publish> {
+    fn check_collision(&mut self, pkid: u16) -> Option<(Publish, Option<u64>)> {
         if let Some(publish) = &self.collision {
             if publish.pkid == pkid {
-                return self.collision.take();
+                return self
+                    .collision
+                    .take()
+                    .map(|publish| (publish, self.tracked_collision.take()));
             }
         }
 
         None
+    }
+
+    fn promote_collision(&mut self, pkid: u16) -> Option<Packet> {
+        let (publish, tracking_id) = self.check_collision(pkid)?;
+        if let Some(id) = tracking_id {
+            self.tracked_outgoing.insert(pkid, id);
+        }
+        self.outgoing_pub[pkid as usize] = Some(publish.clone());
+        self.inflight += 1;
+        self.events
+            .push_back(Event::Outgoing(Outgoing::Publish(pkid)));
+        self.emit_receipt(tracking_id, pkid, PublishReceiptPhase::PacketIdAssigned);
+        self.collision_ping_count = 0;
+        Some(Packet::Publish(publish))
+    }
+
+    fn emit_receipt(&mut self, tracking_id: Option<u64>, pkid: u16, phase: PublishReceiptPhase) {
+        if let Some(tracking_id) = tracking_id {
+            self.events.push_back(Event::PublishReceipt(PublishReceipt {
+                tracking_id,
+                packet_id: Some(pkid),
+                phase,
+            }));
+        }
     }
 
     fn save_pubrel(&mut self, mut pubrel: PubRel) -> Result<PubRel, StateError> {
@@ -686,7 +772,7 @@ impl MqttState {
 mod test {
     use super::mqttbytes::v5::*;
     use super::mqttbytes::*;
-    use super::{Event, Incoming, Outgoing, Request};
+    use super::{Event, Incoming, Outgoing, PublishReceipt, PublishReceiptPhase, Request};
     use super::{MqttState, StateError};
 
     fn build_outgoing_publish(qos: QoS) -> Publish {
@@ -979,6 +1065,176 @@ mod test {
         mqtt.handle_incoming_pubcomp(&PubComp::new(1, None))
             .unwrap();
         assert_eq!(mqtt.inflight, 0);
+    }
+
+    #[test]
+    fn tracked_qos_one_receipts_survive_packet_id_reuse_and_collision() {
+        let mut mqtt = MqttState::new(1, false);
+        mqtt.handle_outgoing_packet(Request::TrackedPublish(
+            build_outgoing_publish(QoS::AtLeastOnce),
+            101,
+        ))
+        .unwrap();
+        assert!(mqtt.events.iter().any(|event| matches!(
+            event,
+            Event::PublishReceipt(PublishReceipt {
+                tracking_id: 101,
+                packet_id: Some(1),
+                phase: PublishReceiptPhase::PacketIdAssigned,
+            })
+        )));
+        mqtt.events.clear();
+
+        // The second logical message collides with packet ID 1 until the
+        // broker acknowledges the first one.
+        mqtt.handle_outgoing_packet(Request::TrackedPublish(
+            build_outgoing_publish(QoS::AtLeastOnce),
+            202,
+        ))
+        .unwrap();
+        mqtt.handle_incoming_puback(&PubAck::new(1, None)).unwrap();
+        let receipts: Vec<_> = mqtt
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                Event::PublishReceipt(receipt) => Some((receipt.tracking_id, receipt.phase)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            receipts,
+            [
+                (101, PublishReceiptPhase::Confirmed),
+                (202, PublishReceiptPhase::PacketIdAssigned)
+            ]
+        );
+        mqtt.events.clear();
+        mqtt.handle_incoming_puback(&PubAck::new(1, None)).unwrap();
+        assert!(mqtt.events.iter().any(|event| matches!(
+            event,
+            Event::PublishReceipt(PublishReceipt {
+                tracking_id: 202,
+                packet_id: Some(1),
+                phase: PublishReceiptPhase::Confirmed,
+            })
+        )));
+    }
+
+    #[test]
+    fn tracked_qos_two_completes_only_after_pubcomp() {
+        let mut mqtt = MqttState::new(2, false);
+        mqtt.handle_outgoing_packet(Request::TrackedPublish(
+            build_outgoing_publish(QoS::ExactlyOnce),
+            303,
+        ))
+        .unwrap();
+        mqtt.events.clear();
+        mqtt.handle_incoming_pubrec(&PubRec::new(1, None)).unwrap();
+        assert!(mqtt.events.iter().any(|event| matches!(
+            event,
+            Event::PublishReceipt(PublishReceipt {
+                tracking_id: 303,
+                phase: PublishReceiptPhase::PubRec,
+                ..
+            })
+        )));
+        assert!(!mqtt.events.iter().any(|event| matches!(
+            event,
+            Event::PublishReceipt(PublishReceipt {
+                phase: PublishReceiptPhase::Confirmed,
+                ..
+            })
+        )));
+        mqtt.events.clear();
+        mqtt.handle_incoming_pubcomp(&PubComp::new(1, None))
+            .unwrap();
+        assert!(mqtt.events.iter().any(|event| matches!(
+            event,
+            Event::PublishReceipt(PublishReceipt {
+                tracking_id: 303,
+                phase: PublishReceiptPhase::Confirmed,
+                ..
+            })
+        )));
+    }
+
+    #[test]
+    fn tracked_publishes_and_pubrel_report_new_session_loss() {
+        let mut mqtt = MqttState::new(2, false);
+        mqtt.handle_outgoing_packet(Request::TrackedPublish(
+            build_outgoing_publish(QoS::ExactlyOnce),
+            404,
+        ))
+        .unwrap();
+        mqtt.handle_incoming_pubrec(&PubRec::new(1, None)).unwrap();
+        let mut pending = std::collections::VecDeque::from(mqtt.clean());
+        assert!(pending
+            .iter()
+            .any(|request| matches!(request, Request::PubRel(_))));
+        assert_eq!(mqtt.discard_session(&mut pending), vec![404]);
+        assert!(pending.is_empty());
+
+        mqtt.handle_outgoing_packet(Request::TrackedPublish(
+            build_outgoing_publish(QoS::AtLeastOnce),
+            505,
+        ))
+        .unwrap();
+        let mut pending = std::collections::VecDeque::from(mqtt.clean());
+        assert!(pending
+            .iter()
+            .any(|request| matches!(request, Request::TrackedPublish(_, 505))));
+        assert_eq!(mqtt.discard_session(&mut pending), vec![505]);
+    }
+
+    #[test]
+    fn tracked_terminal_receipt_survives_new_session_cleanup() {
+        let mut mqtt = MqttState::new(2, false);
+        mqtt.handle_outgoing_packet(Request::TrackedPublish(
+            build_outgoing_publish(QoS::AtLeastOnce),
+            606,
+        ))
+        .unwrap();
+        mqtt.handle_incoming_puback(&PubAck::new(1, None)).unwrap();
+        let mut pending = std::collections::VecDeque::new();
+        assert!(mqtt.discard_session(&mut pending).is_empty());
+        assert_eq!(mqtt.events.len(), 1);
+        assert!(matches!(
+            mqtt.events.pop_front(),
+            Some(Event::PublishReceipt(PublishReceipt {
+                tracking_id: 606,
+                phase: PublishReceiptPhase::Confirmed,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn tracked_qos_two_pubrel_resumes_with_same_identity() {
+        let mut mqtt = MqttState::new(2, false);
+        mqtt.handle_outgoing_packet(Request::TrackedPublish(
+            build_outgoing_publish(QoS::ExactlyOnce),
+            707,
+        ))
+        .unwrap();
+        mqtt.handle_incoming_pubrec(&PubRec::new(1, None)).unwrap();
+        let pending = mqtt.clean();
+        assert!(pending
+            .iter()
+            .any(|request| matches!(request, Request::PubRel(_))));
+        for request in pending {
+            mqtt.handle_outgoing_packet(request).unwrap();
+        }
+        mqtt.events.clear();
+        mqtt.handle_incoming_pubcomp(&PubComp::new(1, None))
+            .unwrap();
+        assert!(mqtt.events.iter().any(|event| matches!(
+            event,
+            Event::PublishReceipt(PublishReceipt {
+                tracking_id: 707,
+                phase: PublishReceiptPhase::Confirmed,
+                ..
+            })
+        )));
     }
 
     #[test]
